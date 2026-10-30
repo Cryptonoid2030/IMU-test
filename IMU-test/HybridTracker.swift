@@ -18,6 +18,7 @@ class HybridTracker: NSObject, ARSessionDelegate {
     private var arSession = ARSession()
     private var ekf = EKFFusionEngine()
     private var pointCloudMap = PointCloudMap(voxelSize: 0.02, maxPoints: 40_000)
+    private var loopManager = LoopClosureManager()
 
     // --- Published State for SwiftUI / SceneKit ---
     var pureSE3Transform: simd_float4x4 = matrix_identity_float4x4
@@ -25,6 +26,34 @@ class HybridTracker: NSObject, ARSessionDelegate {
     var velocity = simd_float3(0, 0, 0)
     var path: [simd_float3] = []
     var featurePoints: [simd_float3] = []
+
+    // --- Bag of Words Loop Closure Published State ---
+    var isLoopClosureActive: Bool = false
+    var latestLoopClosure: LoopClosureEvent? = nil
+    var loopClosureCount: Int = 0
+    var keyframeCount: Int = 0
+    var loopClosureHistory: [LoopClosureEvent] = []
+    var loopLinks: [(from: simd_float3, to: simd_float3)] = []
+    var isPointCloudVisible: Bool = true
+    private var loopIndicatorResetTimer: Timer?
+
+    // --- Graph SLAM Hyperparameter Tuning ---
+    var loopWeight: Float {
+        get { loopManager.slamConfig.loopWeight }
+        set { loopManager.slamConfig.loopWeight = newValue }
+    }
+    var maxDriftClamp: Float {
+        get { loopManager.slamConfig.maxDriftClamp }
+        set { loopManager.slamConfig.maxDriftClamp = newValue }
+    }
+    var huberThreshold: Float {
+        get { loopManager.slamConfig.huberThreshold }
+        set { loopManager.slamConfig.huberThreshold = newValue }
+    }
+    var livePoseDamping: Float {
+        get { loopManager.slamConfig.livePoseDamping }
+        set { loopManager.slamConfig.livePoseDamping = newValue }
+    }
 
     // --- Sensor Timing & Latest Camera Observations ---
     private var lastIMUTime: TimeInterval = 0
@@ -65,6 +94,15 @@ class HybridTracker: NSObject, ARSessionDelegate {
         featurePoints.removeAll()
         pointCloudMap.reset()
         ekf.reset()
+        loopManager.reset()
+        loopLinks.removeAll()
+        latestLoopClosure = nil
+        loopClosureCount = 0
+        keyframeCount = 0
+        loopClosureHistory.removeAll()
+        isLoopClosureActive = false
+        loopIndicatorResetTimer?.invalidate()
+        loopIndicatorResetTimer = nil
 
         pureSE3Transform = ekf.pureSE3Transform
         position = ekf.position
@@ -87,6 +125,8 @@ class HybridTracker: NSObject, ARSessionDelegate {
     func stop() {
         optimizationTimer?.invalidate()
         optimizationTimer = nil
+        loopIndicatorResetTimer?.invalidate()
+        loopIndicatorResetTimer = nil
         motionManager.stopDeviceMotionUpdates()
         arSession.pause()
     }
@@ -151,6 +191,57 @@ class HybridTracker: NSObject, ARSessionDelegate {
 
         if let rawFeatures = frame.rawFeaturePoints, pointCloudMap.accumulate(rawFeatures) {
             featurePoints = pointCloudMap.points
+        }
+
+        // Evaluate frame for Visual Bag-of-Words loop closure
+        if hasReceivedCameraFrame {
+            if let loop = loopManager.processFrame(
+                frame: frame,
+                currentPose: pureSE3Transform,
+                currentPosition: position,
+                currentOrientation: ekf.orientation,
+                accumulatedFeatures: featurePoints
+            ) {
+                handleLoopClosure(loop)
+            }
+            keyframeCount = loopManager.keyframes.count
+        }
+    }
+
+    // MARK: - Loop Closure Handling & Correction
+    private func handleLoopClosure(_ loop: LoopClosureEvent) {
+        // 1. Optimize the trajectory graph using Graph SLAM (Gauss-Newton with Accelerate Sparse Cholesky)
+        let (optimizedPath, liveCorrection) = loopManager.optimizePoseGraph(path: path, loop: loop)
+        path = optimizedPath
+
+        // 2. Adjust EKF nominal state with clamped, damped Graph SLAM correction
+        //    This prevents loop closures from dragging the current live pose far from physical reality!
+        ekf.applyLoopClosureCorrection(deltaTranslation: liveCorrection)
+        syncPublishedState()
+
+        // 3. Record 3D visual link
+        loopLinks.append((from: loop.queryPosition, to: loop.matchedPosition))
+
+        // 4. Update UI indicator state
+        latestLoopClosure = loop
+        loopClosureCount = loopManager.loopHistory.count
+        loopClosureHistory = loopManager.loopHistory
+        isLoopClosureActive = true
+
+        // 5. Schedule indicator pulse timeout
+        loopIndicatorResetTimer?.invalidate()
+        loopIndicatorResetTimer = Timer.scheduledTimer(withTimeInterval: 4.5, repeats: false) { [weak self] _ in
+            self?.isLoopClosureActive = false
+        }
+    }
+
+    /// Manually triggers a simulated loop closure for instant interactive UI demonstration
+    func triggerSimulatedLoopClosure() {
+        if let loop = loopManager.triggerSimulatedLoopClosure(
+            currentPosition: position,
+            currentPose: pureSE3Transform
+        ) {
+            handleLoopClosure(loop)
         }
     }
 

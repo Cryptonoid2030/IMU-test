@@ -184,7 +184,16 @@ class EKFFusionEngine {
         return true
     }
 
-    // MARK: - 3. Reset State & Covariance
+    // MARK: - 3. Loop Closure Correction
+    /// Injects a discrete loop closure translation update onto the nominal state and contracts positional uncertainty
+    func applyLoopClosureCorrection(deltaTranslation: simd_float3) {
+        position += deltaTranslation
+        pureSE3Transform = SE3.compose(rotation: orientation, translation: position)
+        pPos = simd_max(pPos * 0.4, simd_float3(repeating: 1e-4))
+        pVel *= 0.8
+    }
+
+    // MARK: - 4. Reset State & Covariance
     func reset() {
         pureSE3Transform = matrix_identity_float4x4
         position = simd_float3(0, 0, 0)

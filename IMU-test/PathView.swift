@@ -1,9 +1,9 @@
 //
-//  PoseView.swift
+//  PathView.swift
 //  IMU-test
 //
 //  Created by JohnQuavious JeanCarlo on 9/28/26.
-//  Visualization for point cloud and pose data
+//  Visualization for point cloud, SE(3) pose, and Bag-of-Words loop closures
 //
 
 import SwiftUI
@@ -14,11 +14,16 @@ struct PathView: UIViewRepresentable {
     var transform: simd_float4x4
     var path: [simd_float3]
     var featurePoints: [simd_float3]
+    var loopLinks: [(from: simd_float3, to: simd_float3)] = []
+    var isLoopClosureActive: Bool = false
+    var showPointCloud: Bool = true
 
     class Coordinator {
         var lastRenderedPointCount: Int = 0
         var lastFirstPoint: simd_float3 = .zero
         var lastFinalPoint: simd_float3 = .zero
+        var lastRenderedLoopCount: Int = 0
+        var lastPathRevision: Int = 0
     }
 
     func makeCoordinator() -> Coordinator {
@@ -57,6 +62,11 @@ struct PathView: UIViewRepresentable {
         cloudContainerNode.name = "cloudContainer"
         view.scene?.rootNode.addChildNode(cloudContainerNode)
 
+        // Container for 3D loop closure constraint links
+        let loopContainerNode = SCNNode()
+        loopContainerNode.name = "loopContainer"
+        view.scene?.rootNode.addChildNode(loopContainerNode)
+
         return view
     }
 
@@ -65,11 +75,20 @@ struct PathView: UIViewRepresentable {
             phoneNode.simdTransform = transform
         }
 
+        // Render trajectory path dots, rebuilding when path is cleared or corrected via loop closure
         if let pathContainer = uiView.scene?.rootNode.childNode(withName: "pathContainer", recursively: false) {
             let currentDots = pathContainer.childNodes.count
-            if path.count < currentDots {
-                // Path was cleared via recenter()
+            let needsFullRebuild = path.count < currentDots || (loopLinks.count != context.coordinator.lastRenderedLoopCount)
+
+            if needsFullRebuild {
                 pathContainer.childNodes.forEach { $0.removeFromParentNode() }
+                for pt in path {
+                    let sphere = SCNSphere(radius: 0.005)
+                    sphere.firstMaterial?.diffuse.contents = UIColor.red
+                    let dotNode = SCNNode(geometry: sphere)
+                    dotNode.simdPosition = pt
+                    pathContainer.addChildNode(dotNode)
+                }
             } else if path.count > currentDots {
                 for i in currentDots..<path.count {
                     let sphere = SCNSphere(radius: 0.005)
@@ -81,10 +100,25 @@ struct PathView: UIViewRepresentable {
             }
         }
 
+        // Render 3D Loop Closure Constraint Beams and Markers
+        if let loopContainer = uiView.scene?.rootNode.childNode(withName: "loopContainer", recursively: false) {
+            if loopLinks.count != context.coordinator.lastRenderedLoopCount {
+                context.coordinator.lastRenderedLoopCount = loopLinks.count
+                loopContainer.childNodes.forEach { $0.removeFromParentNode() }
+
+                for link in loopLinks {
+                    let linkNode = Self.createLinkNode(from: link.from, to: link.to)
+                    loopContainer.addChildNode(linkNode)
+                }
+            }
+        }
+
         // Render the persistent point cloud efficiently, only rebuilding geometry when the cloud updates
         if let cloudContainer = uiView.scene?.rootNode.childNode(withName: "cloudContainer", recursively: false) {
-            if featurePoints.isEmpty {
-                if !cloudContainer.childNodes.isEmpty {
+            cloudContainer.isHidden = !showPointCloud
+
+            if !showPointCloud || featurePoints.isEmpty {
+                if featurePoints.isEmpty && !cloudContainer.childNodes.isEmpty {
                     cloudContainer.childNodes.forEach { $0.removeFromParentNode() }
                     context.coordinator.lastRenderedPointCount = 0
                 }
@@ -121,5 +155,53 @@ struct PathView: UIViewRepresentable {
             let cloudNode = SCNNode(geometry: geometry)
             cloudContainer.addChildNode(cloudNode)
         }
+    }
+
+    /// Generates a 3D visual link with glowing endpoint beacon spheres and a connecting beam
+    private static func createLinkNode(from start: simd_float3, to end: simd_float3) -> SCNNode {
+        let parent = SCNNode()
+
+        // 1. Endpoint beacon spheres
+        let beaconGeom = SCNSphere(radius: 0.012)
+        beaconGeom.firstMaterial?.diffuse.contents = UIColor.systemGreen
+        beaconGeom.firstMaterial?.emission.contents = UIColor(red: 0.2, green: 1.0, blue: 0.5, alpha: 1.0)
+
+        let startBeacon = SCNNode(geometry: beaconGeom)
+        startBeacon.simdPosition = start
+        parent.addChildNode(startBeacon)
+
+        let endBeacon = SCNNode(geometry: beaconGeom)
+        endBeacon.simdPosition = end
+        parent.addChildNode(endBeacon)
+
+        // 2. Connecting cylindrical constraint beam
+        let delta = end - start
+        let dist = length(delta)
+        guard dist > 1e-4 else { return parent }
+
+        let cylinder = SCNCylinder(radius: 0.005, height: CGFloat(dist))
+        cylinder.firstMaterial?.diffuse.contents = UIColor.systemGreen
+        cylinder.firstMaterial?.emission.contents = UIColor(red: 0.1, green: 0.9, blue: 0.5, alpha: 0.9)
+
+        let beamNode = SCNNode(geometry: cylinder)
+        beamNode.simdPosition = (start + end) * 0.5
+
+        // Orient along delta vector
+        let yAxis = simd_float3(0, 1, 0)
+        let dir = normalize(delta)
+        let dotVal = dot(yAxis, dir)
+
+        if abs(dotVal) > 0.9999 {
+            if dotVal < 0 {
+                beamNode.simdOrientation = simd_quatf(angle: .pi, axis: simd_float3(1, 0, 0))
+            }
+        } else {
+            let axis = normalize(cross(yAxis, dir))
+            let angle = acos(simd_clamp(dotVal, -1.0, 1.0))
+            beamNode.simdOrientation = simd_quatf(angle: angle, axis: axis)
+        }
+
+        parent.addChildNode(beamNode)
+        return parent
     }
 }
